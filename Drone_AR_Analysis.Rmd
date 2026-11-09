@@ -1,0 +1,433 @@
+---
+title: "Task-Oriented AR Interface Design: Reproducible Analysis"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    self_contained: true
+    code_folding: hide
+params:
+  data_dir: "."
+---
+
+# 1. Load and validate the data
+
+Keep this Rmd beside the GitData workbooks and knit to HTML, or pass their
+directory as `params$data_dir` to `rmarkdown::render()`. The analysis uses
+R packages readxl, dplyr, ez, ARTool, emmeans, knitr, and rmarkdown.
+
+```{r setup, message=FALSE}
+library(readxl)
+library(dplyr)
+library(ez)
+library(ARTool)
+library(emmeans)
+
+options(contrasts = c("contr.sum", "contr.poly"), emmeans.lmer.df = "kenward-roger")
+knitr::opts_chunk$set(message = FALSE)
+alpha <- 0.05
+interface_levels <- c("Basic", "FPVAR", "TPVAR", "BothAR")
+interface_codes <- c(no = "Basic", basic = "Basic", fpv = "FPVAR",
+                     fpvar = "FPVAR", tpv = "TPVAR", tpvar = "TPVAR",
+                     both = "BothAR", bothar = "BothAR")
+
+read_input <- function(file, sheet = 1) {
+  read_excel(file.path(params$data_dir, file), sheet = sheet,
+             .name_repair = "unique_quiet")
+}
+
+prepare <- function(data, levels_by_factor, measures, participants) {
+  fields <- c("participant", names(levels_by_factor), measures)
+  stopifnot(all(fields %in% names(data)))
+  data <- as.data.frame(data[fields])
+  data$participant <- factor(data$participant)
+  for (field in names(levels_by_factor)) {
+    values <- trimws(as.character(data[[field]]))
+    if (field == "interface" && identical(levels_by_factor[[field]], interface_levels)) {
+      values <- unname(interface_codes[tolower(values)])
+    }
+    data[[field]] <- factor(values, levels_by_factor[[field]])
+  }
+  stopifnot(!anyNA(data), nlevels(data$participant) == participants,
+            all(do.call(table, data[c("participant", names(levels_by_factor))]) == 1L))
+  for (measure in measures) {
+    stopifnot(is.numeric(data[[measure]]), all(is.finite(data[[measure]])))
+  }
+  data
+}
+
+four_interfaces <- list(interface = interface_levels)
+cue_levels <- list(interface = c("LS", "CC", "CP"))
+system_levels <- c(list(tool = c("real", "sim")), four_interfaces)
+view_levels <- c(system_levels, list(view = c("fpv", "tpv")))
+
+load_task <- function(task_sheet, questionnaire_sheet, count) {
+  list(
+    performance = prepare(read_input("1,3_task performance.xlsx", task_sheet),
+                          four_interfaces, c("time", count), 20),
+    nasa = prepare(read_input("1,3_NasaTLX.xlsx", questionnaire_sheet),
+                   four_interfaces, "score", 20),
+    sus = prepare(read_input("1,3_SUS.xlsx", questionnaire_sheet),
+                  four_interfaces, "score", 20)
+  )
+}
+
+avoidance <- load_task("ObstacleAvoidance", "collision", "collision")
+search <- load_task("TargetSearch", "target", "target")
+stopifnot(identical(levels(avoidance$performance$participant),
+                    levels(search$performance$participant)))
+cue_raw <- read_input("2_cueDesign.xlsx")
+cue_measures <- c("time", "avg30cm", "SUS", intersect("total30cm", names(cue_raw)))
+cue <- prepare(cue_raw, cue_levels, cue_measures, 6)
+
+# Identify the two second-evaluation workbooks by worksheet name.
+system_files <- c("2_performance.xlsx", "2_eyetracking.xlsx")
+read_system <- function(sheet) {
+  matches <- vapply(system_files, function(file) {
+    sheet %in% excel_sheets(file.path(params$data_dir, file))
+  }, logical(1))
+  stopifnot(sum(matches) == 1L)
+  read_input(system_files[matches], sheet)
+}
+real_sim <- prepare(read_system("phase2_new"), system_levels,
+                    c("completion", "collision", "stay30cm", "nasa", "sus", "TPVratio"), 16)
+eye_real_sim <- prepare(read_system("task performance"), view_levels,
+                        c("duration", "avg_duration"), 16)
+stopifnot(identical(levels(real_sim$participant), levels(eye_real_sim$participant)),
+          all(real_sim$TPVratio >= 0 & real_sim$TPVratio <= 1))
+real_sim$TPVratio <- 100 * real_sim$TPVratio
+
+'# Eye-tracking data for Figures 15 and 22.'
+stage1_eye_path <- file.path(params$data_dir, "1,3_eyetracking.xlsx")
+```
+
+```{r helpers, include=FALSE}
+show <- function(data) {
+  if (!nrow(data)) {
+    cat("No follow-up comparisons selected.\n\n")
+    return(invisible(NULL))
+  }
+  for (name in grep("(^p$|^p_|_p$)", names(data), value = TRUE)) {
+    data[[name]] <- format.pval(data[[name]], digits = 4, eps = 1e-16)
+  }
+  print(knitr::kable(data, digits = 4, row.names = FALSE))
+  cat("\n\n")
+}
+
+describe <- function(data, factors) {
+  data |>
+    group_by(across(all_of(factors))) |>
+    summarise(n = n(), mean = mean(y), SD = sd(y), median = median(y),
+              IQR = IQR(y), .groups = "drop")
+}
+
+normality <- function(values) {
+  if (length(values) < 3L || diff(range(values)) < sqrt(.Machine$double.eps)) {
+    return(NA_real_)
+  }
+  shapiro.test(values)$p.value
+}
+
+rm_fit <- function(data, factors) {
+  within <- as.call(c(quote(.), lapply(factors, as.name)))
+  fit <- eval(substitute(ez::ezANOVA(data = data, dv = y, wid = participant,
+                                   within = W, type = 3, detailed = TRUE),
+                         list(W = within)))
+  tests <- subset(fit$ANOVA, Effect != "(Intercept)")
+  mauchly <- fit[["Mauchly's Test for Sphericity"]]
+  correction <- fit[["Sphericity Corrections"]]
+  bind_rows(lapply(seq_len(nrow(tests)), function(i) {
+    row <- tests[i, ]
+    p_mauchly <- if (is.null(mauchly)) NA_real_ else
+      mauchly$p[match(row$Effect, mauchly$Effect)]
+    use_gg <- !is.na(p_mauchly) && p_mauchly < alpha
+    gg <- correction[match(row$Effect, correction$Effect), ]
+    eps <- if (use_gg) min(1, gg$GGe) else 1
+    data.frame(Effect = row$Effect, df1 = row$DFn * eps, df2 = row$DFd * eps,
+               F = row$F, p = if (use_gg) gg[["p[GG]"]] else row$p,
+               eta_p2 = row$SSn / (row$SSn + row$SSd),
+               Mauchly_p = p_mauchly, GG = use_gg)
+  }))
+}
+
+paired <- function(delta, method) {
+  if (method == "t") {
+    if (sd(delta) == 0) return(data.frame(t = NA, df = length(delta)-1,
+                                          p = NA, difference = mean(delta),
+                                          CI_low = NA, CI_high = NA, d_z = NA))
+    fit <- t.test(delta)
+    return(data.frame(t = unname(fit$statistic), df = unname(fit$parameter),
+                      p = fit$p.value, difference = mean(delta),
+                      CI_low = fit$conf.int[1], CI_high = fit$conf.int[2],
+                      d_z = mean(delta) / sd(delta)))
+  }
+  nonzero <- delta[delta != 0]
+  if (!length(nonzero)) return(data.frame(V = 0, p = 1, r_rb = NA))
+  fit <- wilcox.test(delta, exact = FALSE, correct = TRUE)
+  ranks <- rank(abs(nonzero))
+  data.frame(V = unname(fit$statistic), p = fit$p.value,
+             r_rb = 2 * sum(ranks[nonzero > 0]) / sum(ranks) - 1)
+}
+
+pair_table <- function(data, focal, method) {
+  pairs <- combn(levels(data[[focal]]), 2, simplify = FALSE)
+  bind_rows(lapply(pairs, function(groups) {
+    a <- data[data[[focal]] == groups[1], ]
+    b <- data[data[[focal]] == groups[2], ]
+    b <- b[match(a$participant, b$participant), ]
+    stopifnot(identical(a$participant, b$participant))
+    cbind(contrast = paste(groups, collapse = " - "), paired(a$y - b$y, method))
+  }))
+}
+
+adjust_pairs <- function(data) {
+  if (nrow(data)) data$p_Bonferroni <- p.adjust(data$p, "bonferroni", n = nrow(data))
+  data
+}
+
+one_way <- function(data, measure, label, method) {
+  data$y <- data[[measure]]
+  cat("### ", label, "\n\n", sep = "")
+  show(describe(data, "interface"))
+  show(data.frame(Shapiro_p = normality(residuals(lm(y ~ participant + interface, data)))))
+  if (method == "Friedman") {
+    test <- friedman.test(y ~ interface | participant, data)
+    chi <- unname(test$statistic)
+    omnibus <- data.frame(test = method, chi_squared = chi, df = unname(test$parameter),
+                          p = test$p.value, Kendall_W = chi /
+                            (nlevels(data$participant) * (nlevels(data$interface) - 1)))
+  } else {
+    omnibus <- rm_fit(data, "interface")
+  }
+  show(omnibus)
+  if (omnibus$p < alpha) {
+    show(adjust_pairs(pair_table(data, "interface", if (method == "Friedman") "Wilcoxon" else "t")))
+  }
+}
+
+stage1_eye <- function(sheet, dominant) {
+  if (!file.exists(stage1_eye_path)) {
+    cat("Eye-tracking results require the corresponding worksheet of 1,3_eyetracking.xlsx.\n\n")
+    return(invisible(NULL))
+  }
+  raw <- read_input("1,3_eyetracking.xlsx", sheet)
+  names(raw)[match(c("task", "AOI"), names(raw))] <- c("interface", "view")
+  eye <- prepare(raw, c(four_interfaces, list(view = c("fpv", "tpv"))),
+                 c("percent", "mean"), 20)
+  data <- reshape(eye, idvar = c("participant", "interface"),
+                  timevar = "view", direction = "wide")
+  performance <- if (sheet == "collision") avoidance$performance else search$performance
+  keys <- function(x) paste(x$participant, x$interface)
+  stopifnot(setequal(keys(data), keys(performance)),
+            all(abs(data$percent.fpv + data$percent.tpv - 1) < 1e-6))
+  data$FPV_percent <- 100 * data$percent.fpv
+  data$TPV_percent <- 100 * data$percent.tpv
+  data$meanFPV <- data$mean.fpv
+  data$meanTPV <- data$mean.tpv
+  for (metric in c("Fixation proportion (%)", "Mean fixation duration (ms)")) {
+    columns <- if (metric == "Fixation proportion (%)") {
+      c("FPV_percent", "TPV_percent")
+    } else c("meanFPV", "meanTPV")
+    cat("### ", metric, "\n\n", sep = "")
+    comparisons <- bind_rows(lapply(split(data, data$interface), function(rows) {
+      delta <- rows[[columns[1]]] - rows[[columns[2]]]
+      cbind(interface = rows$interface[1],
+            FPV_mean = mean(rows[[columns[1]]]), FPV_SD = sd(rows[[columns[1]]]),
+            TPV_mean = mean(rows[[columns[2]]]), TPV_SD = sd(rows[[columns[2]]]),
+            Shapiro_p = normality(delta),
+            paired(delta, if (metric == "Fixation proportion (%)") "t" else "Wilcoxon"))
+    }))
+    show(adjust_pairs(comparisons))
+  }
+  one_way(data, paste0(dominant, "_percent"),
+          paste(dominant, "fixation proportion across interfaces"), "Friedman")
+}
+
+followup_scopes <- function(omnibus, factors) {
+  significant <- omnibus$Effect[omnibus$p < alpha]
+  interactions <- strsplit(significant[grepl(":", significant)], ":", fixed = TRUE)
+  scopes <- setNames(rep(NA_character_, length(factors)), factors)
+  for (focal in factors) {
+    if (any(vapply(interactions, function(x) focal %in% x, logical(1)))) {
+      scopes[focal] <- "conditional"
+    } else if (focal %in% significant) {
+      scopes[focal] <- "marginal"
+    }
+  }
+  scopes[!is.na(scopes)]
+}
+
+art_followups <- function(model, factors, scopes) {
+  bind_rows(lapply(names(scopes), function(focal) {
+    scope <- scopes[[focal]]
+    term <- if (scope == "marginal") focal else paste(factors, collapse = ":")
+    contrasts <- as.data.frame(summary(art.con(model, term, adjust = "none")))
+    if (scope == "conditional") {
+      pairs <- strsplit(as.character(contrasts$contrast), " - ", fixed = TRUE)
+      keep <- vapply(pairs, function(pair) {
+        a <- strsplit(pair[1], ",", fixed = TRUE)[[1]]
+        b <- strsplit(pair[2], ",", fixed = TRUE)[[1]]
+        stopifnot(length(a) == length(factors), length(b) == length(factors))
+        identical(factors[a != b], focal)
+      }, logical(1))
+      contrasts <- contrasts[keep, , drop = FALSE]
+    }
+    data.frame(Factor = focal, Scope = scope, Contrast = contrasts$contrast,
+               t = contrasts$t.ratio, df = contrasts$df, p = contrasts$p.value,
+               d_rank = contrasts$estimate / sigma(artlm.con(model, term))) |>
+      adjust_pairs()
+  }))
+}
+
+factorial <- function(data, measure, label, factors, method) {
+  data$y <- data[[measure]]
+  rhs <- paste(factors, collapse = "*")
+  cat("### ", label, "\n\n", sep = "")
+  show(describe(data, factors))
+  diagnostics <- lm(reformulate(c("participant", rhs), "y"), data)
+  show(data.frame(Method = method, Shapiro_p = normality(residuals(diagnostics))))
+  if (method == "ART") {
+    model <- art(as.formula(paste("y ~", rhs, "+ (1 | participant)")), data)
+    tests <- as.data.frame(anova(model))
+    omnibus <- data.frame(Effect = rownames(tests), df1 = tests$Df,
+                          df2 = tests$Df.res, F = tests$F, p = tests[["Pr(>F)"]])
+    omnibus$eta_p2_approx <- with(omnibus, F * df1 / (F * df1 + df2))
+    show(omnibus)
+    scopes <- followup_scopes(omnibus, factors)
+    comparisons <- art_followups(model, factors, scopes)
+    # The manuscript additionally reports the overall collision environment contrast.
+    if (measure == "collision") {
+      comparisons <- bind_rows(comparisons, art_followups(model, factors, c(tool = "marginal")))
+    }
+    show(comparisons)
+  } else {
+    omnibus <- rm_fit(data, factors)
+    show(omnibus)
+    scopes <- followup_scopes(omnibus, factors)
+    stopifnot(all(scopes == "marginal"))
+    comparisons <- bind_rows(lapply(names(scopes), function(focal) {
+      marginal <- aggregate(data["y"], data[c("participant", focal)], mean)
+      cbind(Factor = focal, adjust_pairs(pair_table(marginal, focal, "t")))
+    }))
+    show(comparisons)
+  }
+}
+```
+
+# 2. Initial interface evaluation: obstacle avoidance
+
+Use four paired interface conditions. Run the Table 5 omnibus tests, followed by
+Bonferroni-adjusted contrasts where selected. For eye tracking, compare FPV and
+TPV within each interface and test TPV proportions across interfaces.
+
+```{r initial, results='asis'}
+one_way(avoidance$performance, "time", "Completion time (s)", "Friedman")
+one_way(avoidance$performance, "collision", "Collision count", "Friedman")
+one_way(avoidance$nasa, "score", "Weighted NASA-TLX", "RM ANOVA")
+one_way(avoidance$sus, "score", "SUS", "RM ANOVA")
+stage1_eye("collision", "TPV")
+```
+
+# 3. Exploratory TPV AR cue evaluation
+
+Compare LS, CC, and CP within six participants. Summarize total dwell time
+when that column is supplied.
+
+```{r cues, results='asis'}
+one_way(cue, "time", "Completion time (s)", "Friedman")
+one_way(cue, "avg30cm", "Mean warning-zone dwell time (s)", "RM ANOVA")
+one_way(cue, "SUS", "SUS", "RM ANOVA")
+
+if ("total30cm" %in% names(cue)) {
+  cat("### Total warning-zone dwell time (s)\n\n")
+  show(describe(transform(cue, y = total30cm), "interface"))
+} else {
+  cat("Table 6 total dwell time is unavailable in the supplied cue workbook.\n\n")
+}
+
+detectable_dz <- uniroot(function(dz) {
+  power.t.test(n = 6, delta = dz, sd = 1, sig.level = alpha / 3,
+               type = "paired", alternative = "two.sided", strict = TRUE)$power - 0.80
+}, c(0.1, 5))$root
+show(data.frame(n = 6, comparisons = 3, per_comparison_alpha = alpha / 3,
+                power = 0.80, detectable_d_z = detectable_dz))
+```
+
+# 4. Second interface evaluation: real and simulated obstacle avoidance
+
+Use the Table 5 models. Include environment and interface for trial outcomes,
+and add view for the two fixation-duration outcomes. Report Shapiro–Wilk
+diagnostics. Adjust post-hoc p-values by Bonferroni within each outcome,
+factor, and scope. Report conditional comparisons for factors involved in
+significant interactions and marginal comparisons for other significant effects.
+Keep the recorded 0 s values for trials without a warning-zone entry.
+
+```{r second, results='asis'}
+two_factors <- names(system_levels)
+three_factors <- names(view_levels)
+factorial(real_sim, "completion", "Completion time (s)", two_factors, "ART")
+factorial(real_sim, "collision", "Collision count", two_factors, "ART")
+factorial(real_sim, "stay30cm", "Mean warning-zone dwell time (s)", two_factors, "ART")
+factorial(eye_real_sim, "duration", "Total fixation duration (ms)", three_factors, "ART")
+factorial(real_sim, "TPVratio", "TPV fixation proportion (%)", two_factors, "ART")
+factorial(eye_real_sim, "avg_duration", "Mean fixation duration (ms)", three_factors, "ART")
+factorial(real_sim, "nasa", "Weighted NASA-TLX", two_factors, "RM ANOVA")
+factorial(real_sim, "sus", "SUS", two_factors, "ART")
+```
+
+## Relative interface effects
+
+For each participant and environment, subtract Basic from each AR condition.
+Report the mean difference and pointwise 95% t interval as in Figure 20.
+
+```{r relative}
+relative <- function(measure, label) {
+  data <- transform(real_sim, y = real_sim[[measure]])
+  bind_rows(lapply(split(data, data$tool), function(rows) {
+    basic <- rows[rows$interface == "Basic", ]
+    bind_rows(lapply(interface_levels[-1], function(level) {
+      ar <- rows[rows$interface == level, ]
+      delta <- ar$y - basic$y[match(ar$participant, basic$participant)]
+      margin <- qt(0.975, length(delta) - 1) * sd(delta) / sqrt(length(delta))
+      data.frame(Outcome = label, Environment = rows$tool[1],
+                 Contrast = paste(level, "- Basic"), n = length(delta),
+                 Difference = mean(delta), CI_low = mean(delta) - margin,
+                 CI_high = mean(delta) + margin)
+    }))
+  }))
+}
+show(bind_rows(relative("completion", "Completion time (s)"),
+               relative("TPVratio", "TPV fixation proportion (percentage points)"),
+               relative("nasa", "Weighted NASA-TLX"),
+               relative("sus", "SUS")))
+```
+
+# 5. Matrix-guided interface evaluation: target search
+
+Use four paired interface conditions. Apply the Table 5 tests and Bonferroni
+adjustment. For eye tracking, test FPV versus TPV within each interface and
+test FPV proportions across interfaces.
+
+```{r search, results='asis'}
+one_way(search$performance, "time", "Completion time (s)", "Friedman")
+one_way(search$performance, "target", "Target revisit count", "Friedman")
+one_way(search$nasa, "score", "Weighted NASA-TLX", "RM ANOVA")
+one_way(search$sus, "score", "SUS", "RM ANOVA")
+stage1_eye("target", "FPV")
+```
+
+# 6. Input coverage and software versions
+
+`1,3_NasaTLX.xlsx` supplies the weighted scores used for inference.
+`1,3_eyetracking.xlsx` supplies both first-stage eye-tracking worksheets.
+The cue workbook needs `total30cm` for the descriptive total dwell column in Table 6.
+
+```{r versions}
+show(data.frame(
+  Software = c("R", "readxl", "dplyr", "ez", "ARTool", "emmeans", "knitr", "rmarkdown"),
+  Version = c(as.character(getRversion()),
+              vapply(c("readxl", "dplyr", "ez", "ARTool", "emmeans", "knitr", "rmarkdown"),
+                     function(package) as.character(packageVersion(package)), character(1)))
+))
+```
+
